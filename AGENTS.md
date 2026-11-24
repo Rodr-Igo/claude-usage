@@ -80,9 +80,12 @@ Pricing is duplicated in two places that **must stay in sync**:
 
 ### Dashboard server
 
-`http.server.BaseHTTPRequestHandler`-based, two endpoints:
+`http.server.BaseHTTPRequestHandler`-based, three endpoints:
 - `GET /api/data` → JSON snapshot from `get_dashboard_data()`. Returns *all* history; client-side filters by date range and model.
-- `POST /api/rescan` → deletes the DB and runs a full rescan. Passes `db_path` and `projects_dirs` explicitly so tests that monkey-patch the module globals work — scan's default arg values are frozen at def time, so don't switch to bare defaults.
+- `POST /api/rescan` → runs an incremental scan (never deletes the DB). Passes `db_path` and `projects_dirs` explicitly so tests that monkey-patch the module globals work — scan's default arg values are frozen at def time, so don't switch to bare defaults.
+- `GET /api/account` → the "Account vs. This Machine" card (`get_account_data()`), for people who share one Claude account. It reads Claude Code's OAuth token (`~/.claude/.credentials.json`, or the macOS Keychain) and asks `api.anthropic.com/api/oauth/usage` for the account's % of each plan limit, then shows this machine's turns in the same windows. Anthropic reports only percentages, so each rise between stored readings (`account_usage` table, run-length encoded) is attributed to "other devices" when this machine logged no Claude turn in that interval, else to "while this machine was active". "Other devices" is therefore a lower bound. A background thread (`start_account_sampler`) takes a reading every 5 min while the server runs. Readings are keyed by the signed-in account (`oauthAccount.accountUuid` in `~/.claude.json`, re-read on every request so a `/login` switch shows up on the next Refresh). The `account_logins` table records which account was signed in when, so turns made on another account don't count as activity, and the card's "Accounts used on this machine" table compares every account seen. The token must never be logged or returned; the dashboard never refreshes it. `CLAUDE_USAGE_ACCOUNT=off` disables the feature. Tests patch `read_oauth_credentials` / `fetch_account_usage` — keep it that way so the suite never hits the network or real credentials.
+
+`scanner.scan()` holds `scanner.SCAN_LOCK`, so the startup scan, Rescan, and the account refresh never overlap in one process. The account refresh passes `wait=False` and skips its scan if one is already running.
 
 The entire UI lives in `HTML_TEMPLATE` as a raw string. Chart.js is loaded from CDN.
 

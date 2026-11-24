@@ -5,11 +5,18 @@ dashboard.py - Local web dashboard served on localhost:8080.
 import json
 import os
 import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
+import scanner
 from scanner import VERSION, init_db
 
 DB_PATH = Path(os.environ.get("CLAUDE_USAGE_DB", Path.home() / ".claude" / "usage.db"))
@@ -232,6 +239,641 @@ def get_dashboard_data(db_path=DB_PATH):
     }
 
 
+# ── Account-wide plan usage (shared accounts) ────────────────────────────────
+# The JSONL logs only cover this machine. When several people share one Claude
+# account, they all draw on the same plan limits, so the dashboard also asks
+# Anthropic how much of each limit the account has used (the numbers Claude
+# Code's /usage screen shows) and sets this machine's turns in the same windows
+# beside it.
+#
+# Anthropic only reports "% of limit used" per window, never tokens, so this
+# machine's exact share can't be known. Instead every reading is stored in the
+# account_usage table, and each rise between two readings is attributed:
+#   - no Claude turn logged here in that interval -> "other devices"
+#   - at least one turn logged here               -> "while this machine was
+#                                                    active" (others may have
+#                                                    been active too)
+# So "other devices" is a lower bound on everyone else's usage, and it only
+# covers time the dashboard was running to take readings.
+#
+# Privacy: the OAuth token is read from Claude Code's own credential store and
+# sent only to api.anthropic.com. It is never logged and never returned by
+# /api/account. The dashboard never refreshes the token itself, because that
+# would rotate Claude Code's refresh token; when it has expired, running Claude
+# Code refreshes it. Set CLAUDE_USAGE_ACCOUNT=off to turn the feature off.
+
+ACCOUNT_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+ACCOUNT_BETA_HEADER = "oauth-2025-04-20"
+ACCOUNT_CACHE_SECONDS = 90        # reuse a reading this fresh instead of re-asking
+ACCOUNT_FORCE_MIN_SECONDS = 5     # floor for the Refresh button
+ACCOUNT_POLL_SECONDS = 300        # background readings while the server runs
+# Anthropic's meter can lag a turn by a little, so a rise also counts as
+# "active" when this machine logged a turn shortly before the earlier reading.
+# Leaning this way keeps "other devices" a lower bound.
+ACCOUNT_ACTIVE_GRACE = timedelta(minutes=3)
+# resets_at can wobble slightly between calls; within this it's the same window.
+ACCOUNT_SAME_WINDOW = timedelta(minutes=15)
+
+# The limit windows the card shows: (key in Anthropic's response, label,
+# length, model family the window counts or None for all Claude models).
+ACCOUNT_WINDOWS = [
+    ("five_hour",        "5-hour window",       timedelta(hours=5), None),
+    ("seven_day",        "Weekly, all models",  timedelta(days=7),  None),
+    ("seven_day_opus",   "Weekly, Opus",        timedelta(days=7),  "opus"),
+    ("seven_day_sonnet", "Weekly, Sonnet",      timedelta(days=7),  "sonnet"),
+]
+# Only these models draw on the account's limits; turns from local or
+# third-party models (gemma, glm, ...) don't count as activity here.
+CLAUDE_MODEL_FAMILIES = ("fable", "mythos", "opus", "sonnet", "haiku")
+
+ACCOUNT_MESSAGES = {
+    "disabled": "Account comparison is turned off (CLAUDE_USAGE_ACCOUNT=off).",
+    "no_login": ("Claude Code on this machine isn't signed in with a Claude subscription, "
+                 "so there are no account limits to compare against. API-key sign-ins are "
+                 "billed per token and have no plan limits."),
+    "expired": ("Claude Code's sign-in on this machine has expired. Run Claude Code once to "
+                "refresh it, then press Refresh. This dashboard never refreshes the sign-in itself."),
+    "auth": ("Anthropic rejected Claude Code's sign-in token. Run Claude Code once to refresh "
+             "it, then press Refresh."),
+    "rate_limited": "Anthropic is rate-limiting usage checks; trying again shortly.",
+    "network": "Couldn't reach api.anthropic.com.",
+    "http": "Anthropic's usage endpoint returned an error.",
+    "bad_response": "Anthropic's usage endpoint returned something unexpected.",
+    "error": "Couldn't read the account's usage.",
+}
+
+_account_lock = threading.Lock()
+_account_state = {
+    "checked": None,     # time.monotonic() of the last attempt
+    "reading": None,     # last good response from Anthropic
+    "read_at": None,     # datetime (UTC) of that reading
+    "plan": None,        # subscriptionType from Claude Code's credentials
+    "account": None,     # {"id", "email", "org"} Claude Code is signed in to
+    "error": None,       # code from ACCOUNT_MESSAGES for the last failed attempt
+    "detail": None,      # extra text for that failure (never the token)
+}
+
+
+def account_feature_enabled():
+    flag = os.environ.get("CLAUDE_USAGE_ACCOUNT", "").strip().lower()
+    return flag not in ("0", "off", "false", "no")
+
+
+def _claude_config_dir():
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+
+def read_oauth_credentials():
+    """Return Claude Code's ``claudeAiOauth`` block, or None.
+
+    Windows and Linux keep it in ``<config dir>/.credentials.json``; macOS keeps
+    it in the login Keychain (item "Claude Code-credentials"). The block holds
+    the access token: callers must never log it or send it anywhere but
+    api.anthropic.com.
+    """
+    raw = None
+    try:
+        raw = (_claude_config_dir() / ".credentials.json").read_text(encoding="utf-8")
+    except OSError:
+        if sys.platform == "darwin":
+            try:
+                raw = subprocess.run(
+                    ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                    capture_output=True, text=True, timeout=10,
+                ).stdout
+            except (OSError, subprocess.SubprocessError):
+                raw = None
+    if not raw:
+        return None
+    try:
+        oauth = json.loads(raw).get("claudeAiOauth")
+    except (ValueError, AttributeError):
+        return None
+    if isinstance(oauth, dict) and oauth.get("accessToken"):
+        return oauth
+    return None
+
+
+def read_oauth_account():
+    """Which account Claude Code is signed in to: {"id", "email", "org"} or None.
+
+    Claude Code keeps it under ``oauthAccount`` in ``.claude.json``: in the
+    home directory, or inside CLAUDE_CONFIG_DIR when that's set. People who
+    switch between accounts (/login) get each account's readings kept apart.
+    """
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    path = Path(env) / ".claude.json" if env else Path.home() / ".claude.json"
+    try:
+        acct = json.loads(path.read_text(encoding="utf-8")).get("oauthAccount")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(acct, dict) or not acct.get("accountUuid"):
+        return None
+    return {
+        "id":    str(acct["accountUuid"]),
+        "email": acct.get("emailAddress") or None,
+        "org":   acct.get("organizationName") or None,
+    }
+
+
+def fetch_account_usage(access_token, timeout=10):
+    """GET the account's plan-limit usage from Anthropic.
+
+    Returns the parsed JSON, e.g. ``{"five_hour": {"utilization": 38.0,
+    "resets_at": "..."}, "seven_day": {...}, ...}``. Raises urllib errors.
+    """
+    req = urllib.request.Request(ACCOUNT_USAGE_URL, headers={
+        "Authorization": "Bearer " + access_token,
+        "anthropic-beta": ACCOUNT_BETA_HEADER,
+        "Accept": "application/json",
+        "User-Agent": "claude-usage/" + VERSION,
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _parse_utc(value):
+    """ISO-8601 string -> aware UTC datetime, or None."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _iso_utc(dt):
+    """Aware datetime -> '2026-11-24T17:55:53.192Z'.
+
+    Same shape as turns.timestamp, so plain string comparison in SQL orders
+    the two correctly.
+    """
+    dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (dt.microsecond // 1000)
+
+
+def _model_clause(family):
+    """SQL filter (and params) for the turns a limit window counts."""
+    families = (family,) if family else CLAUDE_MODEL_FAMILIES
+    clause = "(" + " OR ".join("LOWER(model) LIKE ?" for _ in families) + ")"
+    return clause, ["%" + f + "%" for f in families]
+
+
+def record_login(conn, account, now):
+    """Note that Claude Code is signed in to ``account`` right now.
+
+    Run-length encoded: while the account doesn't change, only the latest row's
+    last_seen moves forward. A switch (/login) starts a new row.
+    """
+    if not account or not account.get("id"):
+        return
+    seen = _iso_utc(now)
+    last = conn.execute(
+        "SELECT id, account_id FROM account_logins ORDER BY id DESC LIMIT 1").fetchone()
+    if last is not None and last["account_id"] == account["id"]:
+        conn.execute("UPDATE account_logins SET last_seen = ?, email = ?, org = ? WHERE id = ?",
+                     (seen, account.get("email"), account.get("org"), last["id"]))
+    else:
+        conn.execute("INSERT INTO account_logins (account_id, email, org, first_seen, last_seen) "
+                     "VALUES (?, ?, ?, ?, ?)",
+                     (account["id"], account.get("email"), account.get("org"), seen, seen))
+    conn.commit()
+
+
+def other_account_spans(conn, account_id, since):
+    """Stretches since ``since`` when Claude Code here was signed in elsewhere.
+
+    Turns inside them went to another account's limits, so they aren't this
+    account's activity. A switch that happened between two checks is unknown,
+    and those turns still count (which keeps "other devices" a lower bound).
+    """
+    if account_id is None:
+        return []
+    rows = conn.execute(
+        "SELECT first_seen, last_seen FROM account_logins "
+        "WHERE account_id != ? AND last_seen >= ? ORDER BY first_seen",
+        (account_id, since),
+    ).fetchall()
+    return [(r["first_seen"], r["last_seen"]) for r in rows]
+
+
+def _exclude_clause(spans):
+    """SQL that drops turns inside the given (first, last) spans, and params."""
+    clause = "".join(" AND NOT (timestamp >= ? AND timestamp <= ?)" for _ in spans)
+    return clause, [t for span in spans for t in span]
+
+
+def record_account_reading(conn, usage, now, account_id=None):
+    """Store one reading from Anthropic, run-length encoded per bucket.
+
+    A bucket whose window and % are unchanged since the last reading only moves
+    that row's last_seen forward, so the table grows only when usage changes,
+    and attribution still knows when each rise happened. Each account's
+    readings are kept apart.
+    """
+    seen = _iso_utc(now)
+    for bucket, info in usage.items():
+        if not isinstance(info, dict):
+            continue
+        util = info.get("utilization")
+        resets = _parse_utc(info.get("resets_at"))
+        if isinstance(util, bool) or not isinstance(util, (int, float)) or resets is None:
+            continue
+        util = float(util)
+        resets_key = _iso_utc(resets)
+        last = conn.execute(
+            "SELECT id, resets_at, utilization FROM account_usage "
+            "WHERE account_id IS ? AND bucket = ? ORDER BY id DESC LIMIT 1", (account_id, bucket)
+        ).fetchone()
+        if last is not None:
+            last_reset = _parse_utc(last["resets_at"])
+            if last_reset is not None and abs(last_reset - resets) <= ACCOUNT_SAME_WINDOW:
+                resets_key = last["resets_at"]  # same window: keep its first key
+                if last["utilization"] == util:
+                    conn.execute("UPDATE account_usage SET last_seen = ? WHERE id = ?",
+                                 (seen, last["id"]))
+                    continue
+        conn.execute(
+            "INSERT INTO account_usage (account_id, bucket, resets_at, utilization, first_seen, last_seen) "
+            "VALUES (?, ?, ?, ?, ?, ?)", (account_id, bucket, resets_key, util, seen, seen))
+    conn.commit()
+
+
+def _local_turn_between(conn, after, until, family, exclude=()):
+    """True if this machine logged a counted turn in (after, until]."""
+    clause, params = _model_clause(family)
+    skip, skip_params = _exclude_clause(exclude)
+    row = conn.execute(
+        f"SELECT 1 FROM turns WHERE timestamp > ? AND timestamp <= ? AND {clause}{skip} LIMIT 1",
+        [after, until] + params + skip_params,
+    ).fetchone()
+    return row is not None
+
+
+def attribute_window(conn, bucket, resets_key, family, current, account_id=None):
+    """Split a window's account usage (%) into who-was-active buckets.
+
+    Returns {"other", "active", "untracked", "tracked_since", "readings"} or
+    None when no reading of this window is stored. "untracked" is whatever was
+    already used at the first stored reading. Turns made while Claude Code was
+    signed in to a different account don't count as activity.
+    """
+    rows = conn.execute(
+        "SELECT utilization, first_seen, last_seen FROM account_usage "
+        "WHERE account_id IS ? AND bucket = ? AND resets_at = ? ORDER BY first_seen, id",
+        (account_id, bucket, resets_key),
+    ).fetchall()
+    if not rows:
+        return None
+    since = _iso_utc(_parse_utc(rows[0]["first_seen"]) - ACCOUNT_ACTIVE_GRACE)
+    elsewhere = other_account_spans(conn, account_id, since)
+    other = active = 0.0
+    for prev, cur in zip(rows, rows[1:]):
+        rise = cur["utilization"] - prev["utilization"]
+        if rise <= 0:
+            continue
+        after = _parse_utc(prev["last_seen"]) - ACCOUNT_ACTIVE_GRACE
+        if _local_turn_between(conn, _iso_utc(after), cur["first_seen"], family, elsewhere):
+            active += rise
+        else:
+            other += rise
+    untracked = float(rows[0]["utilization"])
+    # Rises sum to the current % unless Anthropic revised a reading downward
+    # mid-window; scale so the three parts always add up to what it reports now.
+    total = other + active + untracked
+    if total > 0 and abs(total - current) > 0.01:
+        k = max(current, 0.0) / total
+        other, active, untracked = other * k, active * k, untracked * k
+    return {
+        "other":         round(other, 2),
+        "active":        round(active, 2),
+        "untracked":     round(untracked, 2),
+        "tracked_since": rows[0]["first_seen"],
+        "readings":      len(rows),
+    }
+
+
+def local_usage_since(conn, start, family, exclude=()):
+    """This machine's counted turns since ``start`` (ISO string), per model.
+
+    Turns inside ``exclude`` spans (signed in to another account) are left out
+    and only counted in ``excluded_turns``.
+    """
+    clause, params = _model_clause(family)
+    skip, skip_params = _exclude_clause(exclude)
+    rows = conn.execute(f"""
+        SELECT COALESCE(NULLIF(model, ''), 'unknown') AS model,
+               SUM(input_tokens)          AS input,
+               SUM(output_tokens)         AS output,
+               SUM(cache_read_tokens)     AS cache_read,
+               SUM(cache_creation_tokens) AS cache_creation,
+               COUNT(*)                   AS turns,
+               MAX(timestamp)             AS last
+        FROM turns
+        WHERE timestamp >= ? AND {clause}{skip}
+        GROUP BY COALESCE(NULLIF(model, ''), 'unknown')
+    """, [start] + params + skip_params).fetchall()
+    excluded = 0
+    if exclude:
+        inside = " OR ".join("(timestamp >= ? AND timestamp <= ?)" for _ in exclude)
+        excluded = conn.execute(
+            f"SELECT COUNT(*) FROM turns WHERE timestamp >= ? AND {clause} AND ({inside})",
+            [start] + params + skip_params,
+        ).fetchone()[0]
+    by_model = [{
+        "model":          r["model"],
+        "input":          r["input"] or 0,
+        "output":         r["output"] or 0,
+        "cache_read":     r["cache_read"] or 0,
+        "cache_creation": r["cache_creation"] or 0,
+        "turns":          r["turns"] or 0,
+    } for r in rows]
+    last = max((r["last"] for r in rows if r["last"]), default=None)
+    return {"by_model": by_model, "last_turn": last, "excluded_turns": excluded}
+
+
+def accounts_summary(conn, current_id, now, days=7):
+    """Every account Claude Code here has been signed in to, side by side.
+
+    Per account: its latest stored limit readings and this machine's turns made
+    while signed in to it over the last ``days`` days. A turn belongs to the
+    account last seen signed in before it, until another account is seen (so a
+    switch between two checks is placed at the later check). Turns from before
+    the first check aren't assigned to any account.
+    """
+    logins = conn.execute(
+        "SELECT account_id, email, org, first_seen, last_seen FROM account_logins "
+        "ORDER BY first_seen, id").fetchall()
+    since = _iso_utc(now - timedelta(days=days))
+    accounts = {}
+    for i, row in enumerate(logins):
+        a = accounts.setdefault(row["account_id"], {
+            "id": row["account_id"], "email": None, "org": None,
+            "last_seen": "", "spans": []})
+        a["email"] = row["email"] or a["email"]
+        a["org"] = row["org"] or a["org"]
+        a["last_seen"] = max(a["last_seen"], row["last_seen"])
+        end = logins[i + 1]["first_seen"] if i + 1 < len(logins) else None
+        a["spans"].append((row["first_seen"], end))
+
+    model_clause, model_params = _model_clause(None)
+    out = []
+    for a in accounts.values():
+        limits = {}
+        for bucket in ("five_hour", "seven_day"):
+            r = conn.execute(
+                "SELECT utilization, resets_at, last_seen FROM account_usage "
+                "WHERE account_id = ? AND bucket = ? ORDER BY id DESC LIMIT 1",
+                (a["id"], bucket)).fetchone()
+            if r is not None:
+                limits[bucket] = {"utilization": r["utilization"], "resets_at": r["resets_at"],
+                                  "as_of": r["last_seen"]}
+        ranges, params = [], []
+        for start, end in a["spans"]:
+            if end is not None and end <= since:
+                continue
+            if end is None:
+                ranges.append("(timestamp >= ?)")
+                params.append(max(start, since))
+            else:
+                ranges.append("(timestamp >= ? AND timestamp < ?)")
+                params += [max(start, since), end]
+        by_model = []
+        if ranges:
+            rows = conn.execute(f"""
+                SELECT COALESCE(NULLIF(model, ''), 'unknown') AS model,
+                       SUM(input_tokens) AS input, SUM(output_tokens) AS output,
+                       SUM(cache_read_tokens) AS cache_read,
+                       SUM(cache_creation_tokens) AS cache_creation, COUNT(*) AS turns
+                FROM turns WHERE {model_clause} AND ({" OR ".join(ranges)})
+                GROUP BY COALESCE(NULLIF(model, ''), 'unknown')
+            """, model_params + params).fetchall()
+            by_model = [{
+                "model": r["model"], "input": r["input"] or 0, "output": r["output"] or 0,
+                "cache_read": r["cache_read"] or 0, "cache_creation": r["cache_creation"] or 0,
+                "turns": r["turns"] or 0,
+            } for r in rows]
+        out.append({
+            "email":     a["email"],
+            "org":       a["org"],
+            "current":   a["id"] == current_id,
+            "last_seen": a["last_seen"],
+            "limits":    limits,
+            "local":     {"by_model": by_model, "days": days},
+        })
+    out.sort(key=lambda a: a["last_seen"], reverse=True)
+    out.sort(key=lambda a: not a["current"])  # current account first
+    return out
+
+
+def _refresh_account_reading(db_path, projects_dirs, force=False, rescan=True):
+    """Take a new reading from Anthropic unless the last one is recent enough.
+
+    Caller holds _account_lock. On failure the previous good reading is kept
+    (the card shows it as stale) and the failure is noted in _account_state.
+    Which account Claude Code is signed in to is re-read on every call, so a
+    switch (/login) shows up at once instead of after the cache expires.
+    """
+    state = _account_state
+    account = read_oauth_account()
+    if (account or {}).get("id") != (state["account"] or {}).get("id"):
+        # Signed in to a different account now: the cached reading belongs to
+        # the previous one, so drop it and take a fresh reading right away.
+        state.update(checked=None, reading=None, read_at=None, plan=None, error=None, detail=None)
+    state["account"] = account
+
+    min_age = ACCOUNT_FORCE_MIN_SECONDS if force else ACCOUNT_CACHE_SECONDS
+    if state["checked"] is not None and time.monotonic() - state["checked"] < min_age:
+        return
+    state["checked"] = time.monotonic()
+
+    creds = read_oauth_credentials()
+    if not creds:
+        state.update(error="no_login", detail=None)
+        return
+    state["plan"] = creds.get("subscriptionType")
+    conn = scanner.get_db(db_path)
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        init_db(conn)
+        record_login(conn, account, datetime.now(timezone.utc))
+    finally:
+        conn.close()
+    expires_ms = creds.get("expiresAt")
+    if isinstance(expires_ms, (int, float)) and expires_ms / 1000.0 < time.time():
+        state.update(error="expired", detail=None)
+        return
+    try:
+        usage = fetch_account_usage(creds["accessToken"])
+    except urllib.error.HTTPError as e:
+        code = "auth" if e.code in (401, 403) else "rate_limited" if e.code == 429 else "http"
+        state.update(error=code, detail="HTTP %d" % e.code)
+        if e.code == 429:
+            state["checked"] = time.monotonic() + 240  # back off ~5 min, Refresh included
+        return
+    except (urllib.error.URLError, OSError) as e:
+        state.update(error="network", detail=str(getattr(e, "reason", e)))
+        return
+    except ValueError:
+        state.update(error="bad_response", detail=None)
+        return
+    if not isinstance(usage, dict):
+        state.update(error="bad_response", detail=None)
+        return
+
+    now = datetime.now(timezone.utc)
+    # Pull in this machine's newest turns so the reading is compared against
+    # current local data. Skipped if a scan is already running (it will pick
+    # them up; the next refresh recomputes the split from scratch).
+    if rescan:
+        try:
+            scanner.scan(db_path=db_path, projects_dirs=projects_dirs, verbose=False, wait=False)
+        except Exception:
+            pass
+    conn = scanner.get_db(db_path)
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        init_db(conn)
+        record_account_reading(conn, usage, now, (account or {}).get("id"))
+    finally:
+        conn.close()
+    state.update(reading=usage, read_at=now, error=None, detail=None)
+
+
+def _surface_breakdown(reading):
+    """The weekly window split by surface (Claude Code, Chats, Cowork, ...).
+
+    Account-wide, so it can't separate two Claude Code users, but it shows how
+    much of "other devices" could be claude.ai chats. None if absent.
+    """
+    breakdown = reading.get("seven_day_breakdown")
+    rows = breakdown.get("rows") if isinstance(breakdown, dict) else None
+    if not isinstance(rows, list):
+        return None
+    out = []
+    for r in rows:
+        if not isinstance(r, dict) or not isinstance(r.get("percent_of_limit"), (int, float)):
+            continue
+        out.append({
+            "name":             str(r.get("display_name") or r.get("key") or "Other"),
+            "percent":          r.get("percent") if isinstance(r.get("percent"), (int, float)) else None,
+            "percent_of_limit": r["percent_of_limit"],
+        })
+    return out or None
+
+
+def get_account_data(db_path=DB_PATH, projects_dirs=None, force=False, rescan=True):
+    """JSON for /api/account: the account's limit windows next to this machine.
+
+    Never includes the OAuth token.
+    """
+    if not account_feature_enabled():
+        return {"status": "disabled", "message": ACCOUNT_MESSAGES["disabled"]}
+    with _account_lock:
+        try:
+            _refresh_account_reading(db_path, projects_dirs, force=force, rescan=rescan)
+        except Exception as e:  # never let a bad reading take the endpoint down
+            _account_state.update(error="error", detail=type(e).__name__)
+        state = dict(_account_state)
+
+    def message(code, detail):
+        text = ACCOUNT_MESSAGES.get(code, ACCOUNT_MESSAGES["error"])
+        return text + (" (" + detail + ")" if detail else "")
+
+    account = state["account"]
+    account_id = (account or {}).get("id")
+    account_label = {"email": account.get("email"), "org": account.get("org")} if account else None
+    reading = state["reading"]
+    now = datetime.now(timezone.utc)
+    windows = []
+    conn = scanner.get_db(db_path)
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000")
+        init_db(conn)
+        accounts = accounts_summary(conn, account_id, now)
+        if reading is None:
+            return {"status": state["error"] or "error",
+                    "message": message(state["error"], state["detail"]),
+                    "account": account_label, "accounts": accounts}
+        for key, label, length, family in ACCOUNT_WINDOWS:
+            info = reading.get(key)
+            if not isinstance(info, dict):
+                continue
+            util = info.get("utilization")
+            if isinstance(util, bool) or not isinstance(util, (int, float)):
+                continue
+            util = float(util)
+            resets = _parse_utc(info.get("resets_at"))
+            window = {
+                "key": key, "label": label, "family": family,
+                "utilization": util,
+                "resets_at": _iso_utc(resets) if resets else None,
+                "window_start": None, "local": None, "attribution": None,
+                "breakdown": _surface_breakdown(reading) if key == "seven_day" else None,
+            }
+            if resets is not None:
+                start = _iso_utc(min(resets - length, now))
+                window["window_start"] = start
+                window["local"] = local_usage_since(
+                    conn, start, family, other_account_spans(conn, account_id, start))
+                # Find the stored window this reading belongs to (its key can
+                # differ from resets_at by the jitter tolerance).
+                row = conn.execute(
+                    "SELECT resets_at FROM account_usage WHERE account_id IS ? AND bucket = ? "
+                    "ORDER BY id DESC LIMIT 1", (account_id, key)
+                ).fetchone()
+                if row is not None:
+                    stored = _parse_utc(row["resets_at"])
+                    if stored is not None and abs(stored - resets) <= ACCOUNT_SAME_WINDOW:
+                        window["attribution"] = attribute_window(
+                            conn, key, row["resets_at"], family, util, account_id)
+            windows.append(window)
+    finally:
+        conn.close()
+
+    stale = state["error"] is not None
+    return {
+        "status":     "ok",
+        "plan":       state["plan"],
+        "account":    account_label,
+        "fetched_at": _iso_utc(state["read_at"]),
+        "stale":      stale,
+        "warning":    message(state["error"], state["detail"]) if stale else None,
+        "grace_min":  int(ACCOUNT_ACTIVE_GRACE.total_seconds() // 60),
+        "windows":    windows,
+        "accounts":   accounts,
+    }
+
+
+def start_account_sampler():
+    """Take a reading every ACCOUNT_POLL_SECONDS while the server runs.
+
+    Attribution only covers time with readings, so sampling shouldn't depend on
+    a browser tab being open. Reads the module globals on each pass so a changed
+    DB_PATH is honored. Doesn't scan: the split is recomputed against the turns
+    table whenever the card loads, so late-scanned turns still count.
+    """
+    if not account_feature_enabled():
+        return None
+
+    def loop():
+        time.sleep(10)  # let startup (and its initial scan) get going first
+        while True:
+            try:
+                with _account_lock:
+                    _refresh_account_reading(DB_PATH, scanner.DEFAULT_PROJECTS_DIRS, rescan=False)
+            except Exception:
+                pass
+            time.sleep(ACCOUNT_POLL_SECONDS)
+
+    t = threading.Thread(target=loop, name="account-sampler", daemon=True)
+    t.start()
+    return t
+
+
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -375,6 +1017,48 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .show-more-btn:hover { color: var(--text); border-color: var(--accent); }
   .show-more-link { color: var(--blue); text-decoration: none; font-size: 12px; cursor: pointer; }
   .show-more-link:hover { text-decoration: underline; }
+  .header-actions { display: flex; align-items: center; gap: 8px; }
+  .row-action { width: 1%; text-align: center; padding-left: 4px; padding-right: 4px; }
+  .row-hide-btn { background: transparent; border: 1px solid transparent; color: var(--muted); width: 22px; height: 22px; padding: 0; border-radius: 4px; cursor: pointer; font-size: 14px; line-height: 1; opacity: 0.35; }
+  tr:hover .row-hide-btn, .row-hide-btn:focus-visible { opacity: 1; }
+  .row-hide-btn:hover { color: var(--text); border-color: var(--border); }
+  tr.row-hidden td:not(.row-action) { opacity: 0.45; }
+  tr.row-hidden .row-hide-btn { opacity: 1; }
+
+  /* Account vs. this machine. Series colors: this machine = --acct-you (the
+     accent stepped into the dark-mode lightness band), other devices = --blue;
+     "before tracking" is unattributed, so it's a muted hatch, not a series. */
+  #sec-account { --acct-you: #d27352; --acct-other: #48A0C7; --acct-untracked: #6F6F70; }
+  .account-meta { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .account-note { color: var(--muted); font-size: 12px; line-height: 1.6; margin-bottom: 16px; }
+  .account-note b { color: var(--text); font-weight: 600; }
+  .account-msg { color: var(--text); font-size: 13px; line-height: 1.6; padding: 4px 0; }
+  .account-warn { color: var(--text); font-size: 12px; margin-bottom: 14px; padding: 8px 12px; border: 1px solid var(--border); border-left: 3px solid #D9A84E; border-radius: 6px; }
+  .account-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }
+  .acct-window { border: 1px solid var(--border); border-radius: 8px; padding: 16px; min-width: 0; }
+  .acct-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+  .acct-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+  .acct-reset { font-size: 11px; color: var(--muted); }
+  .acct-figure { margin-bottom: 10px; color: var(--muted); font-size: 12px; }
+  .acct-pct { font-size: 22px; font-weight: 700; color: var(--text); margin-right: 4px; }
+  .acct-bar { display: flex; gap: 2px; height: 12px; background: var(--border); border-radius: 4px; overflow: hidden; margin-bottom: 10px; }
+  .acct-seg { height: 100%; min-width: 0; }
+  .acct-seg:first-child { border-radius: 4px 0 0 4px; }
+  .seg-other { background: var(--acct-other); }
+  .seg-you { background: var(--acct-you); }
+  .seg-untracked { background: repeating-linear-gradient(135deg, var(--acct-untracked) 0 2px, transparent 2px 5px); }
+  .acct-legend { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+  .acct-legend-row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+  .acct-legend-row b { color: var(--text); font-family: monospace; font-weight: 600; margin-left: auto; }
+  .acct-sw { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+  .acct-share { font-size: 12px; color: var(--text); margin-bottom: 10px; }
+  .acct-local { font-size: 12px; color: var(--muted); line-height: 1.6; border-top: 1px solid var(--border); padding-top: 10px; }
+  .acct-local b { color: var(--text); font-family: monospace; font-weight: 600; }
+  .acct-local + .acct-local { margin-top: 10px; }
+  .acct-accounts { margin-top: 20px; }
+  .acct-accounts .acct-label { margin-bottom: 8px; }
+  .acct-accounts .account-note { margin: 8px 0 0; }
+  .acct-asof { font-size: 11px; }
 
   footer { border-top: 1px solid var(--border); padding: 20px 24px; margin-top: 8px; }
   .footer-content { max-width: 1400px; margin: 0 auto; }
@@ -478,6 +1162,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <nav id="jump-bar" aria-label="Jump to section">
   <button class="jump-link" data-target="stats-row">Overview</button>
+  <button class="jump-link" data-target="sec-account">Account</button>
   <div class="jump-menu">
     <button type="button" class="jump-trigger" aria-haspopup="true" aria-expanded="false">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M8 17v-4"/><path d="M13 17V8"/><path d="M18 17v-7"/></svg>
@@ -508,6 +1193,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <div class="container">
   <div class="stats-row" id="stats-row"></div>
+  <div class="table-card" id="sec-account" data-card="account">
+    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Account vs. This Machine <span class="info-icon" tabindex="0" role="img" aria-label="About this section" title="Everyone signed in to this Claude account shares its plan limits. Anthropic reports only the % of each limit the whole account has used; this machine's numbers come from its own Claude Code logs. Not affected by the Models or Range filters."><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></span></div><div class="header-actions"><span class="account-meta" id="account-meta"></span><button class="export-btn" id="account-refresh-btn" onclick="loadAccount(true)" title="Re-read which account Claude Code is signed in to, and ask Anthropic for its usage now">&#x21bb; Refresh</button></div></div>
+    <div id="account-body"><div class="account-msg muted">Loading account usage&hellip;</div></div>
+  </div>
   <div class="charts-grid">
     <div class="chart-card wide" id="sec-daily" data-card="daily">
       <h2><span class="card-caret">&#9656;</span><span id="daily-chart-title">Daily Token Usage</span></h2>
@@ -568,7 +1257,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="table-foot" id="dispatches-foot"></div>
   </div>
   <div class="table-card" id="sec-sessions" data-card="sessions">
-    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Recent Sessions</div><button class="export-btn" onclick="exportSessionsCSV()" title="Export all filtered sessions to CSV">&#x2913; CSV</button></div>
+    <div class="section-header"><div class="section-title"><span class="card-caret">&#9656;</span>Recent Sessions</div><div class="header-actions"><button class="export-btn" id="sessions-hidden-btn" onclick="toggleShowHiddenSessions()" title="Show or hide the sessions you hid from this table" hidden></button><button class="export-btn" onclick="exportSessionsCSV()" title="Export all filtered sessions to CSV">&#x2913; CSV</button></div></div>
     <table>
       <thead><tr>
         <th>Session</th>
@@ -581,6 +1270,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <th class="sortable" onclick="setSessionSort('input')">Input <span class="sort-icon" id="sort-icon-input"></span></th>
         <th class="sortable" onclick="setSessionSort('output')">Output <span class="sort-icon" id="sort-icon-output"></span></th>
         <th class="sortable" onclick="setSessionSort('cost')">Est. Cost <span class="sort-icon" id="sort-icon-cost"></span></th>
+        <th class="row-action" aria-label="Hide"></th>
       </tr></thead>
       <tbody id="sessions-body"></tbody>
     </table>
@@ -660,6 +1350,22 @@ let lastByProject = [];
 let lastByProjectBranch = [];
 let lastFilteredDispatches = [];
 let sessionSortDir = 'desc';
+
+// Sessions the user hid from the Recent Sessions table (× button), by session
+// id, persisted in localStorage. Hiding only affects that table and its CSV;
+// totals, charts and the cost tables still count every session.
+const HIDDEN_SESSIONS_KEY = 'cu_hidden_sessions';
+let hiddenSessions = loadHiddenSessions();
+let showHiddenSessions = false;
+let sessionsInRange = [];  // filtered sessions before hidden ones are dropped
+
+function loadHiddenSessions() {
+  try { return new Set(JSON.parse(localStorage.getItem(HIDDEN_SESSIONS_KEY) || '[]')); }
+  catch (e) { return new Set(); }
+}
+function saveHiddenSessions() {
+  try { localStorage.setItem(HIDDEN_SESSIONS_KEY, JSON.stringify([...hiddenSessions])); } catch (e) {}
+}
 
 // Tables reveal rows in steps: 10 -> 25 -> 50, capped at 50 because rendering
 // more than that visibly hurts performance. Past 50 the footer offers a
@@ -1300,11 +2006,11 @@ function applyFilter() {
   renderSubagentChart(byAgentType);
   lastFilteredDispatches = filteredDispatches;
   renderTopDispatches(lastFilteredDispatches);
-  lastFilteredSessions = sortSessions(filteredSessions);
+  sessionsInRange = filteredSessions;
   lastByModel = byModel;
   lastByProject = sortProjects(byProject);
   lastByProjectBranch = sortProjectBranch(byProjectBranch);
-  renderSessionsTable(lastFilteredSessions);
+  refreshSessionsTable();
   renderModelCostTable(lastByModel);
   renderProjectCostTable(lastByProject);
   renderProjectBranchCostTable(lastByProjectBranch);
@@ -1650,9 +2356,40 @@ function lessBranchRows()  { branchLimit   = TABLE_STEPS[0]; renderProjectBranch
 function moreDispatchRows(){ dispatchesLimit = nextTableLimit(dispatchesLimit, lastFilteredDispatches.length); renderTopDispatches(lastFilteredDispatches); }
 function lessDispatchRows(){ dispatchesLimit = TABLE_STEPS[0]; renderTopDispatches(lastFilteredDispatches);            scrollTableToTop('dispatches-body'); }
 
+// Drops hidden sessions (unless "Show hidden" is on), sorts, renders, and keeps
+// the header's "Show hidden (N)" button in step with how many are in range.
+function refreshSessionsTable() {
+  const hiddenCount = sessionsInRange.filter(s => hiddenSessions.has(s.session_id)).length;
+  if (!hiddenCount) showHiddenSessions = false;
+  const visible = showHiddenSessions ? sessionsInRange : sessionsInRange.filter(s => !hiddenSessions.has(s.session_id));
+  lastFilteredSessions = sortSessions(visible);
+  renderSessionsTable(lastFilteredSessions);
+  const btn = document.getElementById('sessions-hidden-btn');
+  btn.hidden = hiddenCount === 0;
+  btn.textContent = (showHiddenSessions ? 'Hide hidden' : 'Show hidden') + ' (' + hiddenCount + ')';
+}
+
+function toggleSessionHidden(i) {
+  const s = lastFilteredSessions[i];
+  if (!s) return;
+  if (hiddenSessions.has(s.session_id)) hiddenSessions.delete(s.session_id);
+  else hiddenSessions.add(s.session_id);
+  saveHiddenSessions();
+  refreshSessionsTable();
+}
+
+function toggleShowHiddenSessions() {
+  showHiddenSessions = !showHiddenSessions;
+  refreshSessionsTable();
+}
+
 function renderSessionsTable(sessions) {
   const shown = sessions.slice(0, shownCount(sessionsLimit, sessions.length));
-  document.getElementById('sessions-body').innerHTML = shown.map(s => {
+  document.getElementById('sessions-body').innerHTML = shown.map((s, i) => {
+    const isHidden = hiddenSessions.has(s.session_id);
+    const hideBtn = isHidden
+      ? `<button class="row-hide-btn" onclick="toggleSessionHidden(${i})" title="Unhide this session" aria-label="Unhide this session">&#x21BA;</button>`
+      : `<button class="row-hide-btn" onclick="toggleSessionHidden(${i})" title="Hide this session from Recent Sessions" aria-label="Hide this session">&times;</button>`;
     const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
     const costCell = isBillable(s.model)
       ? `<td class="cost">${fmtCost(cost)}</td>`
@@ -1660,7 +2397,7 @@ function renderSessionsTable(sessions) {
     const titleCell = s.topic
       ? `<td class="topic-cell" title="${esc(s.topic)}">${esc(s.topic)}</td>`
       : `<td class="topic-cell"><span class="untitled">Untitled</span></td>`;
-    return `<tr>
+    return `<tr${isHidden ? ' class="row-hidden"' : ''}>
       <td class="muted" style="font-family:monospace">${esc(s.session_id.slice(0, 8))}&hellip;</td>
       <td>${esc(s.project)}</td>
       ${titleCell}
@@ -1671,6 +2408,7 @@ function renderSessionsTable(sessions) {
       <td class="num">${fmt(s.input)}</td>
       <td class="num">${fmt(s.output)}</td>
       ${costCell}
+      <td class="row-action">${hideBtn}</td>
     </tr>`;
   }).join('');
   renderTableToggle('sessions-foot', sessions.length, sessionsLimit, 'lessSessionRows', 'moreSessionRows', 'exportSessionsCSV');
@@ -1914,6 +2652,188 @@ async function triggerRescan() {
     console.error(e);
   }
   setTimeout(() => { btn.textContent = '\u21bb Rescan'; btn.disabled = false; }, 3000);
+}
+
+// ── Account vs. this machine ───────────────────────────────────────────────
+// Served by /api/account (get_account_data in dashboard.py). The windows are
+// the account's own limit windows, so this card ignores the Models and Range
+// filters. Anthropic reports only "% of limit used" for the whole account; the
+// server splits each rise by whether this machine was logging turns at the time.
+const ACCOUNT_POLL_MS = 120000;
+
+function fmtPct(p) {
+  return (Math.round(p * 10) / 10).toLocaleString(undefined, { maximumFractionDigits: 1 }) + '%';
+}
+
+function fmtSpan(ms) {
+  if (ms <= 0) return 'now';
+  const mins = Math.round(ms / 60000);
+  if (mins < 60) return mins + 'm';
+  const h = Math.floor(mins / 60), m = mins % 60;
+  if (h < 24) return m ? h + 'h ' + m + 'm' : h + 'h';
+  const d = Math.floor(h / 24), rh = h % 24;
+  return rh ? d + 'd ' + rh + 'h' : d + 'd';
+}
+
+function fmtWhen(iso, withDay) {
+  const opts = withDay ? { weekday: 'short', hour: '2-digit', minute: '2-digit' } : { hour: '2-digit', minute: '2-digit' };
+  return new Date(iso).toLocaleString(undefined, opts);
+}
+
+function fmtDateTime(iso) {
+  return new Date(iso).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function accountName(a) {
+  return (a && (a.email || a.org)) || 'unknown account';
+}
+
+async function loadAccount(force) {
+  if (!force && document.hidden) return;
+  const btn = document.getElementById('account-refresh-btn');
+  if (force && btn) btn.disabled = true;
+  try {
+    const resp = await fetch('/api/account' + (force ? '?refresh=1' : ''));
+    renderAccount(await resp.json());
+  } catch (e) {
+    console.error(e);
+    renderAccount({ status: 'error', message: "Couldn't load account usage from the dashboard server." });
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function renderAccount(d) {
+  const body = document.getElementById('account-body');
+  const meta = document.getElementById('account-meta');
+  if (!body || !meta) return;
+  const who = d && d.account ? 'Signed in as ' + accountName(d.account) : '';
+  if (!d || d.status !== 'ok') {
+    meta.textContent = who;
+    body.innerHTML = `<div class="account-msg">${esc((d && d.message) || 'Account usage is unavailable.')}</div>` +
+      accountsTableHTML(d && d.accounts);
+    return;
+  }
+  const plan = d.plan ? d.plan.charAt(0).toUpperCase() + d.plan.slice(1) + ' plan' : '';
+  const checked = 'checked ' + new Date(d.fetched_at).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  meta.textContent = [who, plan, checked].filter(Boolean).join(' · ');
+  const warn = d.stale && d.warning
+    ? `<div class="account-warn">Showing the last reading (${esc(fmtWhen(d.fetched_at, true))}). ${esc(d.warning)}</div>`
+    : '';
+  const note = `<div class="account-note">Everyone signed in to this account shares these limits. <b>Other devices</b> is account usage that happened while this machine logged no Claude turns on this account, so it's a floor for the other dev's usage (plus any claude.ai or desktop-app chats). Turns made while Claude Code here was signed in to a different account don't count. Usage is only attributed while this dashboard is running and taking readings.</div>`;
+  const windows = (d.windows || []).map(accountWindowHTML).join('');
+  body.innerHTML = warn + note + (windows
+    ? `<div class="account-grid">${windows}</div>`
+    : '<div class="account-msg">Anthropic returned no limit windows for this account.</div>') +
+    accountsTableHTML(d.accounts);
+}
+
+// Side-by-side view of every account Claude Code on this machine has been
+// signed in to (e.g. a company account and a personal one): each account's
+// latest limit readings and the turns made here while signed in to it.
+// Hidden until a second account has been seen.
+function accountsTableHTML(accounts) {
+  if (!accounts || accounts.length < 2) return '';
+  const limitCell = (l) => {
+    if (!l) return '<td class="muted">&mdash;</td>';
+    if (l.resets_at && new Date(l.resets_at).getTime() < Date.now()) {
+      return `<td class="muted" title="${esc('Was ' + fmtPct(l.utilization) + '; that window has reset since this dashboard last read it')}">reset</td>`;
+    }
+    return `<td><span class="num">${fmtPct(l.utilization)}</span> <span class="muted acct-asof">as of ${esc(fmtDateTime(l.as_of))}</span></td>`;
+  };
+  const days = accounts[0].local.days;
+  const rows = accounts.map(a => {
+    let turns = 0, cost = 0;
+    for (const m of a.local.by_model) {
+      turns += m.turns;
+      cost += calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation);
+    }
+    const org = a.email && a.org ? `<div class="muted acct-asof">${esc(a.org)}</div>` : '';
+    return `<tr>
+      <td>${esc(accountName(a))}${a.current ? ' <span class="model-tag">current</span>' : ''}${org}</td>
+      <td class="muted">${a.current ? 'now' : esc(fmtDateTime(a.last_seen))}</td>
+      ${limitCell(a.limits.five_hour)}
+      ${limitCell(a.limits.seven_day)}
+      <td class="num">${fmt(turns)}</td>
+      <td class="cost">${fmtCostBig(cost)}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="acct-accounts">
+    <div class="acct-label">Accounts used on this machine</div>
+    <table>
+      <thead><tr><th>Account</th><th>Last signed in here</th><th>5-hour limit</th><th>Weekly limit</th><th>Turns here, ${days}d</th><th>Est. Cost, ${days}d</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="account-note">Each turn counts toward the account Claude Code was signed in to at the time, as seen by this dashboard's checks. A switch made between two checks is placed at the later check.</div>
+  </div>`;
+}
+
+function accountWindowHTML(w) {
+  const weekly = w.key !== 'five_hour';
+  const util = Math.max(0, Math.min(100, w.utilization));
+  const reset = w.resets_at
+    ? 'resets in ' + fmtSpan(new Date(w.resets_at).getTime() - Date.now()) + ' · ' + fmtWhen(w.resets_at, weekly)
+    : 'no usage in the current window';
+
+  const a = w.attribution;
+  let bar = '', legend = '', share = '', aria = 'Account at ' + fmtPct(util) + ' of this limit';
+  if (a) {
+    const parts = [
+      { cls: 'seg-other',     label: 'Other devices',                 v: a.other,
+        tip: 'Account usage while this machine logged no Claude turns' },
+      { cls: 'seg-you',       label: 'While this machine was active', v: a.active,
+        tip: 'Account usage while this machine was logging turns. Others may have been active at the same time.' },
+      { cls: 'seg-untracked', label: 'Before tracking started',       v: a.untracked,
+        tip: "Already used when this dashboard took its first reading of this window, so it can't be attributed" },
+    ];
+    bar = parts.filter(p => p.v > 0).map(p =>
+      `<span class="acct-seg ${p.cls}" style="width:${Math.min(100, p.v)}%" title="${esc(p.label + ': ' + fmtPct(p.v) + '. ' + p.tip)}"></span>`
+    ).join('');
+    legend = '<div class="acct-legend">' + parts.map(p =>
+      `<div class="acct-legend-row" title="${esc(p.tip)}"><span class="acct-sw ${p.cls}"></span>${esc(p.label)}<b>${fmtPct(p.v)}</b></div>`
+    ).join('') + '</div>';
+    aria += ': ' + parts.map(p => p.label.toLowerCase() + ' ' + fmtPct(p.v)).join(', ');
+    const tracked = a.other + a.active;
+    if (tracked > 0 && a.other > 0) {
+      share = `<div class="acct-share">Of the usage tracked in this window, at least <b>${fmtPct(a.other / tracked * 100)}</b> came from other devices.</div>`;
+    } else if (tracked > 0) {
+      share = `<div class="acct-share">All usage tracked in this window happened while this machine was active on this account.</div>`;
+    } else if (a.readings <= 1) {
+      share = `<div class="acct-share muted">New usage gets attributed from here on (tracking began ${esc(fmtWhen(a.tracked_since, weekly))}).</div>`;
+    }
+  } else if (util > 0) {
+    bar = `<span class="acct-seg seg-untracked" style="width:${util}%" title="${esc('Account: ' + fmtPct(util))}"></span>`;
+  }
+
+  let surfaces = '';
+  if (w.breakdown && w.breakdown.length) {
+    surfaces = `<div class="acct-local" title="Anthropic's own split of the account's weekly usage by surface. It can't separate two people using Claude Code.">Account this week by surface: ` +
+      w.breakdown.map(s => `${esc(s.name)} <b>${fmtPct(s.percent_of_limit)}</b>`).join(' &middot; ') + '</div>';
+  }
+
+  let local = '';
+  if (w.local) {
+    let inp = 0, out = 0, cost = 0, turns = 0;
+    for (const m of w.local.by_model) {
+      inp += m.input; out += m.output; turns += m.turns;
+      cost += calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation);
+    }
+    local = turns
+      ? `This machine in this window: <b>${fmt(turns)}</b> turns &middot; <b>${fmt(inp)}</b> input &middot; <b>${fmt(out)}</b> output tokens &middot; <b>${fmtCostBig(cost)}</b> at API prices` +
+        (w.local.last_turn ? ` &middot; last turn ${esc(fmtWhen(w.local.last_turn, weekly))}` : '')
+      : 'This machine: no Claude turns on this account in this window.';
+    if (w.local.excluded_turns) {
+      local += ` <span title="Made while Claude Code here was signed in to a different account">(${fmt(w.local.excluded_turns)} turns on another account left out)</span>`;
+    }
+    local = `<div class="acct-local">${local}</div>`;
+  }
+
+  return `<div class="acct-window">
+    <div class="acct-head"><div class="acct-label">${esc(w.label)}</div><div class="acct-reset">${esc(reset)}</div></div>
+    <div class="acct-figure"><span class="acct-pct">${fmtPct(util)}</span>of the account's limit used</div>
+    <div class="acct-bar" role="img" aria-label="${esc(aria)}">${bar}</div>
+    ${legend}${share}${surfaces}${local}
+  </div>`;
 }
 
 // ── Data loading ───────────────────────────────────────────────────────────
@@ -2184,6 +3104,9 @@ initFooterMeta();
 initSectionNav();
 loadData();
 scheduleAutoRefresh();
+loadAccount(false);
+setInterval(() => loadAccount(false), ACCOUNT_POLL_MS);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) loadAccount(false); });
 </script>
 </body>
 </html>
@@ -2247,6 +3170,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
+        elif path == "/api/account":
+            # Same explicit-globals contract as /api/data and /api/rescan.
+            force = parse_qs(urlparse(self.path).query).get("refresh", [""])[0] == "1"
+            data = get_account_data(DB_PATH, scanner.DEFAULT_PROJECTS_DIRS, force=force)
+            body = json.dumps(data).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         elif path == "/icon.svg":
             icon = find_icon_file()
             if icon is None:
@@ -2300,6 +3235,7 @@ def serve(host=None, port=None, surface=None):
     host = host or os.environ.get("HOST", "localhost")
     port = port or int(os.environ.get("PORT", "8080"))
     server = ThreadingHTTPServer((host, port), DashboardHandler)
+    start_account_sampler()
     print(f"Dashboard running at http://{host}:{port}")
     print("Press Ctrl+C to stop.")
     try:

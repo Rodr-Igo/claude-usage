@@ -6,6 +6,7 @@ import json
 import os
 import glob
 import sqlite3
+import threading
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -21,6 +22,9 @@ PROJECTS_DIR = Path.home() / ".claude" / "projects"
 XCODE_PROJECTS_DIR = Path.home() / "Library" / "Developer" / "Xcode" / "CodingAssistant" / "ClaudeAgentConfig" / "projects"
 DB_PATH = Path(os.environ.get("CLAUDE_USAGE_DB", Path.home() / ".claude" / "usage.db"))
 DEFAULT_PROJECTS_DIRS = [PROJECTS_DIR, XCODE_PROJECTS_DIR]
+
+# Serializes scan() within one process (see scan()).
+SCAN_LOCK = threading.Lock()
 
 # Higher number = higher priority when choosing a session's primary model.
 # Fable / Mythos are Anthropic's most capable class, so they outrank Opus.
@@ -102,11 +106,39 @@ def init_db(conn):
             value TEXT
         );
 
+        -- Readings of the account-wide plan limits (dashboard.py, shared
+        -- accounts). Run-length encoded: one row per (account, bucket, window,
+        -- %) with the first and last time that value was seen.
+        CREATE TABLE IF NOT EXISTS account_usage (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id  TEXT,
+            bucket      TEXT,
+            resets_at   TEXT,
+            utilization REAL,
+            first_seen  TEXT,
+            last_seen   TEXT
+        );
+
+        -- Which Claude account Claude Code on this machine was signed in to,
+        -- and when (run-length encoded), so turns made on one account aren't
+        -- counted as activity on another.
+        CREATE TABLE IF NOT EXISTS account_logins (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id  TEXT,
+            email       TEXT,
+            org         TEXT,
+            first_seen  TEXT,
+            last_seen   TEXT
+        );
+
         CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
         CREATE INDEX IF NOT EXISTS idx_turns_timestamp ON turns(timestamp);
         CREATE INDEX IF NOT EXISTS idx_sessions_first ON sessions(first_timestamp);
         CREATE INDEX IF NOT EXISTS idx_agents_type ON agents(agent_type);
     """)
+    _ensure_column(conn, "account_usage", "account_id", "TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_account_usage_key "
+                 "ON account_usage(account_id, bucket, resets_at)")
     # Add message_id column if upgrading from older schema
     try:
         conn.execute("SELECT message_id FROM turns LIMIT 1")
@@ -573,7 +605,22 @@ def insert_turns(conn, turns):
     ])
 
 
-def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
+def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True, wait=True):
+    """Scan transcripts into the DB. Scans in one process run one at a time.
+
+    The dashboard can start several: its startup scan, the Rescan button and the
+    account-usage refresh. With wait=False, return None at once if another scan
+    is already running instead of queueing behind it.
+    """
+    if not SCAN_LOCK.acquire(blocking=wait):
+        return None
+    try:
+        return _scan(projects_dir, projects_dirs, db_path, verbose)
+    finally:
+        SCAN_LOCK.release()
+
+
+def _scan(projects_dir, projects_dirs, db_path, verbose):
     conn = get_db(db_path)
     init_db(conn)
 
